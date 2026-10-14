@@ -1,13 +1,15 @@
 """ナンピン(グリッド・マーチン)EA の Python バックテスター (EURUSD / GBPUSD などドルストレート用)。
 
-EA のロジック (金スレッドの MQL5 EA 仕様に合わせたもの):
-  * バスケットにポジションが無ければ、バー始値で初期ロットを建てる。
-    トレンドフィルタ有効時は、直前バー終値が 200MA より上なら買い、下なら売りのみ新規。
-  * 最後の建値から「ナンピン幅」だけ逆行するたびに、ロット = 初期ロット × 倍率^n で追加。
-    最大本数に達したらそれ以上は建てない。
-  * バスケットの平均建値から TP 幅だけ有利になった時点 (= 合計利益が「総ロット × TP幅」に到達)
-    で全ポジションを一括決済。
-  * 口座損切り: 含み損で有効証拠金が「残高 × (1 - 損切り%)」を割ったら全決済 (取引は継続)。
+EA のロジック (fx/ea/mql5/GoldNanpinEA.mq5 の仕様に合わせたもの。括弧内は EA の入力名):
+  * バスケットにポジションが無ければ、バー始値で初期ロット (InpInitLot) を建てる。
+    トレンドフィルタ有効時は、確定した 4時間足の終値が 100SMA より上なら買い、下なら売りのみ新規
+    (InpFilterTF=H4 / InpFilterMA=100)。
+  * 最後の建値から「ナンピン幅」(InpGridStep) だけ逆行するたびに、ロット = 初期ロット × 倍率^n
+    (InpMultiplier) で追加。最大本数 (InpMaxPositions) に達したらそれ以上は建てない。
+  * バスケットの合計損益 (スワップ込み) が「初期ロットが利確幅 (InpTPMove) 動いた分の利益」に
+    達したら全ポジションを一括決済。
+  * 口座損切り (InpAccountStopPct): 含み損が残高の % に達したら全決済し、
+    クールダウン (InpCooldownMin=1440分) の間は新規を止める。
   * 証拠金維持率がロスカット水準を割ったら全決済し、その時点で「破綻」として停止。
 
 約定モデル:
@@ -30,6 +32,7 @@ import pandas as pd
 from numba import njit, prange
 
 CONTRACT = 100_000.0
+EPS = 1e-9  # 価格比較の浮動小数誤差の許容幅
 MODE_BUY, MODE_SELL, MODE_BOTH = 0, 1, 2
 MODE_NAMES = {MODE_BUY: "買いのみ", MODE_SELL: "売りのみ", MODE_BOTH: "両建て"}
 
@@ -47,6 +50,7 @@ class Account:
     spread_pips: float = 1.0
     swap_usd_per_lot_day: float = -5.0  # 売り買いとも 1 ロット 1 日 -5 USD (保守的な仮定)
     pip: float = 0.0001
+    cooldown_min: float = 1440.0  # 口座損切り後に新規を止める時間 (EA の InpCooldownMin)
 
 
 @dataclass
@@ -74,20 +78,31 @@ def load_h1(path) -> pd.DataFrame:
     return df.sort_values("time").reset_index(drop=True)
 
 
-def prepare(df: pd.DataFrame, ma_period: int = 200):
-    """numba に渡す配列を作る。ma は直前バーまでの終値で計算した値 (先読みなし)。"""
+def prepare(df: pd.DataFrame, filter_hours: int = 4, filter_period: int = 100):
+    """numba に渡す配列を作る。
+
+    ma / prev_close は「そのバーの時点で確定している filter_hours 時間足」の SMA と終値 (先読みなし)。
+    """
     o = df["open"].to_numpy(np.float64)
     h = df["high"].to_numpy(np.float64)
     l = df["low"].to_numpy(np.float64)
     c = df["close"].to_numpy(np.float64)
-    ma = df["close"].rolling(ma_period).mean().shift(1).to_numpy(np.float64)
-    prev_close = df["close"].shift(1).to_numpy(np.float64)
+    ft = df.set_index("time")["close"].resample(f"{filter_hours}h").last().dropna()
+    fsma = ft.rolling(filter_period).mean()
+    bin_end = (ft.index + pd.Timedelta(hours=filter_hours)).to_numpy()
+    idx = np.searchsorted(bin_end, df["time"].to_numpy(), side="right") - 1
+    valid = idx >= 0
+    ma = np.full(len(df), np.nan)
+    prev_close = np.full(len(df), np.nan)
+    ma[valid] = fsma.to_numpy()[idx[valid]]
+    prev_close[valid] = ft.to_numpy()[idx[valid]]
+    tmin = (df["time"].astype("int64") // 60_000_000_000).to_numpy(np.float64)
     d = df["time"].dt.normalize()
     newday = (d != d.shift(1)).to_numpy().copy()
     newday[0] = False
     # 水曜のロールオーバー (= 木曜の最初のバー) は 3 日分
     swap_days = np.where(newday, np.where(df["time"].dt.dayofweek.to_numpy() == 3, 3.0, 1.0), 0.0)
-    return o, h, l, c, ma, prev_close, swap_days
+    return o, h, l, c, ma, prev_close, swap_days, tmin
 
 
 @njit(cache=True)
@@ -98,21 +113,25 @@ def _lot(init_lot, mult, k):
 
 
 @njit(cache=True)
-def _simulate(o, h, l, c, ma, prev_close, swap_days,
+def _simulate(o, h, l, c, ma, prev_close, swap_days, tmin,
               mode, init_lot, mult, grid_pips, max_pos, tp_pips, stop_pct, use_ma,
-              capital_jpy, usdjpy, leverage, stopout_level, spread_pips, swap_usd, pip,
+              capital_jpy, usdjpy, leverage, stopout_level, spread_pips, swap_usd, pip, cooldown,
               start, end, eq_out):
     """1 通りの設定で [start, end) を検証する。eq_out が長さ>0 ならバー終値時点の有効証拠金(円)を書く。"""
     res = np.zeros(N_RESULT)
     spr = spread_pips * pip
     grid = grid_pips * pip
-    tp = tp_pips * pip
+    tp = tp_pips * pip  # 初期ロットがこの幅動いた分の利益で一括決済
     mp = int(max_pos)
     # バスケット [0]=買い [1]=売り。建値は Ask(買い)/Bid(売り) で保持
     lots = np.zeros((2, mp))
     ents = np.zeros((2, mp))
     n = np.zeros(2, np.int64)
     margin = np.zeros(2)  # 円
+    swb = np.zeros(2)  # バスケットごとの累積スワップ (円)
+    cool_until = -1e18
+    tp_money = init_lot * CONTRACT * tp * usdjpy  # 一括決済の目標利益 (円)
+    cu = CONTRACT * usdjpy
     bal = capital_jpy  # 円
     peak = capital_jpy
     maxdd = 0.0
@@ -132,11 +151,13 @@ def _simulate(o, h, l, c, ma, prev_close, swap_days,
     for i in range(start, end):
         # --- ロールオーバーのスワップ
         if swap_days[i] > 0.0:
-            tl = 0.0
             for s in range(2):
+                tl = 0.0
                 for k in range(n[s]):
                     tl += lots[s, k]
-            bal += tl * swap_usd * swap_days[i] * usdjpy
+                sw = tl * swap_usd * swap_days[i] * usdjpy
+                bal += sw
+                swb[s] += sw
 
         # --- 新規バスケット (バー始値で)
         for s in range(2):
@@ -145,6 +166,8 @@ def _simulate(o, h, l, c, ma, prev_close, swap_days,
             if s == 0 and not use_buy:
                 continue
             if s == 1 and not use_sell:
+                continue
+            if tmin[i] < cool_until:
                 continue
             if use_ma == 1:
                 if np.isnan(ma[i]):
@@ -195,7 +218,7 @@ def _simulate(o, h, l, c, ma, prev_close, swap_days,
                 if down:
                     while n[0] < mp:
                         lvl = ents[0, n[0] - 1] - grid - spr  # Bid 水準
-                        if b > lvl:
+                        if b > lvl + EPS:
                             break
                         fill = b if gap else lvl
                         px = fill + spr
@@ -220,11 +243,14 @@ def _simulate(o, h, l, c, ma, prev_close, swap_days,
                     for k in range(n[0]):
                         sl += lots[0, k]
                         sv += lots[0, k] * ents[0, k]
-                    target = sv / sl + tp
-                    if b >= target:
+                    # 合計損益 (スワップ込み) が目標利益に届く Bid
+                    target = ((tp_money - swb[0]) / cu + sv) / sl
+                    if b >= target - EPS:
                         fill = b if gap else target
-                        pnl = (fill * sl - sv) * CONTRACT * usdjpy
+                        pnl = (fill * sl - sv) * cu
                         bal += pnl
+                        pnl += swb[0]
+                        swb[0] = 0.0
                         if pnl >= 0:
                             gross_w += pnl
                         else:
@@ -237,7 +263,7 @@ def _simulate(o, h, l, c, ma, prev_close, swap_days,
                 if not down:
                     while n[1] < mp:
                         lvl = ents[1, n[1] - 1] + grid  # Bid 水準
-                        if b < lvl:
+                        if b < lvl - EPS:
                             break
                         fill = b if gap else lvl
                         lt = _lot(init_lot, mult, n[1])
@@ -261,11 +287,13 @@ def _simulate(o, h, l, c, ma, prev_close, swap_days,
                     for k in range(n[1]):
                         sl += lots[1, k]
                         sv += lots[1, k] * ents[1, k]
-                    target = sv / sl - tp - spr  # Bid 水準
-                    if b <= target:
+                    target = (sv - (tp_money - swb[1]) / cu) / sl - spr  # Bid 水準
+                    if b <= target + EPS:
                         fill = b if gap else target
-                        pnl = (sv - (fill + spr) * sl) * CONTRACT * usdjpy
+                        pnl = (sv - (fill + spr) * sl) * cu
                         bal += pnl
+                        pnl += swb[1]
+                        swb[1] = 0.0
                         if pnl >= 0:
                             gross_w += pnl
                         else:
@@ -326,11 +354,14 @@ def _simulate(o, h, l, c, ma, prev_close, swap_days,
                 n[1] = 0
                 margin[0] = 0.0
                 margin[1] = 0.0
+                swb[0] = 0.0
+                swb[1] = 0.0
                 if thr_so >= thr_sl:
                     busted = True
                     bust_bar = i
                     break
                 stops += 1
+                cool_until = tmin[i] + cooldown
                 continue
             dd = (peak - eq_b) / peak
             if dd > maxdd:
@@ -374,15 +405,15 @@ def _simulate(o, h, l, c, ma, prev_close, swap_days,
 
 
 @njit(parallel=True, cache=True)
-def _run_grid(o, h, l, c, ma, prev_close, swap_days, P,
-              capital_jpy, usdjpy, leverage, stopout_level, spread_pips, swap_usd, pip, start, end):
+def _run_grid(o, h, l, c, ma, prev_close, swap_days, tmin, P,
+              capital_jpy, usdjpy, leverage, stopout_level, spread_pips, swap_usd, pip, cooldown, start, end):
     m = P.shape[0]
     out = np.zeros((m, N_RESULT))
     empty = np.zeros(0)
     for j in prange(m):
-        out[j] = _simulate(o, h, l, c, ma, prev_close, swap_days,
+        out[j] = _simulate(o, h, l, c, ma, prev_close, swap_days, tmin,
                            int(P[j, 0]), P[j, 1], P[j, 2], P[j, 3], P[j, 4], P[j, 5], P[j, 6], int(P[j, 7]),
-                           capital_jpy, usdjpy, leverage, stopout_level, spread_pips, swap_usd, pip,
+                           capital_jpy, usdjpy, leverage, stopout_level, spread_pips, swap_usd, pip, cooldown,
                            start, end, empty)
     return out
 
@@ -407,19 +438,19 @@ def _to_frame(P: np.ndarray, R: np.ndarray, acct: Account) -> pd.DataFrame:
 
 
 def run_grid(arrays, P: np.ndarray, acct: Account, start: int, end: int) -> pd.DataFrame:
-    o, h, l, c, ma, pc, sw = arrays
-    R = _run_grid(o, h, l, c, ma, pc, sw, np.ascontiguousarray(P, dtype=np.float64),
+    o, h, l, c, ma, pc, sw, tm = arrays
+    R = _run_grid(o, h, l, c, ma, pc, sw, tm, np.ascontiguousarray(P, dtype=np.float64),
                   acct.capital_jpy, acct.usdjpy, acct.leverage, acct.stopout_level,
-                  acct.spread_pips, acct.swap_usd_per_lot_day, acct.pip, start, end)
+                  acct.spread_pips, acct.swap_usd_per_lot_day, acct.pip, acct.cooldown_min, start, end)
     return _to_frame(P, R, acct)
 
 
 def run_one(arrays, p: Params, acct: Account, start: int, end: int, curve: bool = False):
-    o, h, l, c, ma, pc, sw = arrays
+    o, h, l, c, ma, pc, sw, tm = arrays
     eq = np.zeros(end - start) if curve else np.zeros(0)
-    r = _simulate(o, h, l, c, ma, pc, sw, p.mode, p.init_lot, p.mult, p.grid_pips, p.max_pos,
+    r = _simulate(o, h, l, c, ma, pc, sw, tm, p.mode, p.init_lot, p.mult, p.grid_pips, p.max_pos,
                   p.tp_pips, p.stop_pct, p.use_ma, acct.capital_jpy, acct.usdjpy, acct.leverage,
                   acct.stopout_level, acct.spread_pips, acct.swap_usd_per_lot_day, acct.pip,
-                  start, end, eq)
+                  acct.cooldown_min, start, end, eq)
     df = _to_frame(np.array([p.as_row()], dtype=np.float64), r[None, :], acct)
     return (df.iloc[0], eq) if curve else df.iloc[0]

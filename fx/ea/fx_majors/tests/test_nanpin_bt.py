@@ -32,14 +32,14 @@ def test_single_take_profit():
     assert abs(r.profit_jpy - 1500) < 1
 
 
-def test_nanpin_average_take_profit():
-    # 1.1000 買い 0.1、1.0980 で 0.1 追加 (倍率1.0) → 平均 1.0990 + 10pips = 1.1000 で一括利確
+def test_nanpin_basket_take_profit():
+    # 1.1000 買い 0.1、1.0980 で 0.1 追加 (倍率1.0)。目標利益は「初期 0.1 ロットが 10pips 動いた分」=10 USD。
+    # 合計 0.2 ロットなので平均 1.0990 + 5pips = 1.0995 で一括決済される
     df = bars([1.1000, 1.0990, 1.0980, 1.0990, 1.1000])
     r = run(df, mode=bt.MODE_BUY, init_lot=0.1, mult=1.0, grid_pips=20, max_pos=5, tp_pips=10)
     assert r.max_open == 2
     assert r.baskets == 1
-    # 合計 0.2 ロット × 10pips = 20 USD = 3000 円 (期末に新規 1 本は同値)
-    assert abs(r.profit_jpy - 3000) < 1
+    assert abs(r.profit_jpy - 1500) < 1
 
 
 def test_lot_multiplier_rounding():
@@ -64,8 +64,20 @@ def test_account_stop_limits_loss():
 
 
 def test_ma_filter_blocks_counter_trend_entries():
-    # 下落トレンド中は 200MA の下なので買いバスケットは始まらない
+    # 下落トレンド中は 4時間足 100SMA の下なので買いバスケットは始まらない
     df = bars(np.linspace(1.20, 1.10, 600))
     r = run(df, mode=bt.MODE_BUY, init_lot=0.1, grid_pips=20, max_pos=5, tp_pips=10, use_ma=1)
     assert r.max_open == 0
     assert r.profit_jpy == 0
+
+
+def test_cooldown_after_account_stop():
+    # 急落で口座損切り → 1440 分は新規を建てない。その後は再開する
+    closes = np.r_[np.linspace(1.20, 1.10, 200), np.full(23, 1.10), np.full(10, 1.10)]
+    df = bars(closes)
+    r = run(df, mode=bt.MODE_BUY, init_lot=0.1, mult=1.0, grid_pips=20, max_pos=50, tp_pips=10, stop_pct=1)
+    assert r.stops >= 1
+    no_cool = bt.run_one(bt.prepare(df), bt.Params(mode=bt.MODE_BUY, init_lot=0.1, mult=1.0, grid_pips=20,
+                                                  max_pos=50, tp_pips=10, stop_pct=1),
+                         bt.Account(spread_pips=0.0, swap_usd_per_lot_day=0.0, cooldown_min=0), 0, len(df))
+    assert no_cool.stops > r.stops

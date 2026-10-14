@@ -43,7 +43,7 @@ TOP_N = 10
 
 LABELS = {
     "mode": "方向", "init_lot": "初期ロット", "mult": "倍率", "grid_pips": "ナンピン幅(pips)",
-    "max_pos": "最大本数", "tp_pips": "利確幅(pips)", "stop_pct": "口座損切り(%)", "use_ma": "200MAフィルタ",
+    "max_pos": "最大本数", "tp_pips": "利確幅(pips)", "stop_pct": "口座損切り(%)", "use_ma": "4時間足100SMAフィルタ",
 }
 
 
@@ -56,7 +56,7 @@ def param_matrix() -> np.ndarray:
 def describe(row) -> str:
     r = {k: row[k] for k in bt.PARAM_COLS}
     stop = f"口座損切り{int(r['stop_pct'])}%" if r["stop_pct"] > 0 else "損切りなし"
-    ma = "200MAあり" if r["use_ma"] else "MAなし"
+    ma = "SMAフィルタあり" if r["use_ma"] else "フィルタなし"
     return (f"{bt.MODE_NAMES[int(r['mode'])]} / 初期{r['init_lot']:.2f}ロット / 倍率{r['mult']:g} / "
             f"幅{r['grid_pips']:g}pips / 最大{int(r['max_pos'])}本 / 利確{r['tp_pips']:g}pips / {stop} / {ma}")
 
@@ -90,8 +90,8 @@ def daily_arrays(pair: str):
     d = pd.read_csv(DATA / f"{pair}_D1_close.csv", parse_dates=["time"])
     d = d[d.time >= "2022-03-07"].reset_index(drop=True)
     df = pd.DataFrame({"time": d.time, "open": d.close, "high": d.close, "low": d.close, "close": d.close})
-    # H1 の 200 本 ≒ 8.3 営業日なので日足では 8 日移動平均で代用
-    return df, bt.prepare(df, ma_period=8)
+    # 4時間足 100 本 ≒ 17 営業日なので、日足では 17 日 SMA で代用
+    return df, bt.prepare(df, filter_hours=24, filter_period=17)
 
 
 def md_table(df: pd.DataFrame) -> str:
@@ -181,7 +181,7 @@ def main() -> None:
         cand_b = cand[cand.max_dd_pct <= SAFE_DD]
         picks.append((f"B: 前半DD{SAFE_DD:g}%以内で利益最大", cand_b))
         m15 = bt.load_h1(DATA / f"{pair}_M15.csv")
-        m_arr = bt.prepare(m15, ma_period=800)  # 15分足 800 本 = 1時間足 200 本相当
+        m_arr = bt.prepare(m15)
         m_mid = int(m15.time.searchsorted(tm))
         dd, darr = daily_arrays(pair)
         stats["recent_start"] = str(dd.time.iloc[0].date())
