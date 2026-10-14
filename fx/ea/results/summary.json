@@ -1,0 +1,10 @@
+{
+  "n_configs": 28800,
+  "foldA_n_opt_ok": 7591,
+  "foldA_n_both_ok": 2438,
+  "foldA_top30_val_ok": 0,
+  "foldB_n_opt_ok": 7712,
+  "foldB_n_both_ok": 2438,
+  "foldB_top30_val_ok": 0,
+  "n_all_ok": 2328
+}
