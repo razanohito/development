@@ -57,6 +57,7 @@ def summarize_history() -> tuple[pd.DataFrame, str]:
 def run_grid(m1: pd.DataFrame) -> pd.DataFrame:
     arrs = bt.prepare(m1)
     roll_high, trend = bt.features(m1, LOOKBACK, EMA)
+    tmin = bt.minutes(m1)
     split_i = int(np.searchsorted(m1["time"].to_numpy(), np.datetime64(SPLIT)))
     periods = {"full": (0, len(m1)), "h1": (0, split_i), "h2": (split_i, len(m1))}
     rows = []
@@ -68,7 +69,7 @@ def run_grid(m1: pd.DataFrame) -> pd.DataFrame:
         row = dict(p)
         for name, (s, e) in periods.items():
             pnl, dd, maxlots, _, _ = bt.run(*arrs, roll_high, trend, LOTS, PER_LEVEL, p["dip"], p["step"],
-                                         p["max_levels"], p["tp"], p["sl"], p["trend"], SPREAD, SWAP, s, e)
+                                         p["max_levels"], p["tp"], p["sl"], p["trend"], SPREAD, SWAP, s, e, tmin)
             gp, gl = pnl[pnl > 0].sum(), -pnl[pnl < 0].sum()
             row[f"{name}_net_jpy"] = pnl.sum() * USDJPY
             row[f"{name}_n"] = len(pnl)
@@ -85,7 +86,7 @@ def equity(m1: pd.DataFrame, p: dict) -> pd.Series:
     arrs = bt.prepare(m1)
     roll_high, trend = bt.features(m1, LOOKBACK, EMA)
     pnl, _, _, eq, span = bt.run(*arrs, roll_high, trend, LOTS, PER_LEVEL, p["dip"], p["step"], p["max_levels"],
-                                 p["tp"], p["sl"], p["trend"], SPREAD, SWAP, 0, len(m1))
+                                 p["tp"], p["sl"], p["trend"], SPREAD, SWAP, 0, len(m1), bt.minutes(m1))
     return pd.Series(eq * USDJPY, index=m1["time"]), pnl, span
 
 
