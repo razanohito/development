@@ -11,13 +11,35 @@ Chieko さんから届いた MT5 取引履歴のスクリーンショット 5 �
   履歴に近い設定 (押し目 $5, 幅 $9, 最大 3 段, 利確 $5, 損切りなし) は勝率 99% だが、4 月高値で捕まった 1 回で -5,023 万円 (0.50 ロット換算)、通算 -3,030 万円。
 * スクショの 5 日間が勝ちだけなのは「損切りしない買い下がり」の典型的な見え方で、これだけでは手法の良し悪しは判断できない。全期間の口座履歴 (入出金・含み損・負けトレード込み) が必要。
 
+## 改良版 (optimize.py, 2026-10-21)
+
+これまでの EA 検証の傾向 (損切りなしは 1 回で破綻 / 金ナンピンEA では H4 SMA100 が最も安定 / 前半だけで選ぶと後半で崩れる) を入れて、
+EA に「H4 SMA100 フィルタ」「時間切れ決済」「損切り後の休み」を足し、151,200 通りを探索した。詳細は [results/optimize.md](results/optimize.md)。
+
+* 損切りあり・前半後半とも黒字・PF > 1.1・100 回以上・8 週間 x 15 期間の 12 期間以上黒字・コスト悪化でも黒字・近傍合格率 60% 以上、で絞って
+  純損益 / 最大DD が最大の設定を EA の初期値にした。
+* 新しい初期値 (0.01 ロット x 3 本/段, 2026-04-20〜09-25): 109 回, 勝率 98%, PF 2.33, **+10.1 万円, 最大DD 4.3 万円**, 15 期間すべて黒字, 近傍合格率 86%。
+  旧初期値は同じ期間で -17.9 万円, 最大DD 45.5 万円, 15 期間中 4 期間だけ黒字。
+* 傾向: 押し目は大きいほど良い ($10 は合格 0%, $80 は 35%)。小さな押し目を何度も拾うと、大きな下げで損切りが重なる。
+  利確は小さめ ($3〜5) の方が合格率が高い。
+* H4 SMA100 の下 (下落トレンド) では買わないので、2026-06〜07 の下落局面はほとんど取引しない。
+
+## EA の初期値
+
+`Lots=0.01`, `PositionsPerLevel=3`, `LookbackMinutes=480`, `DipUSD=60`, `TrendFilter=H4 SMA100`, `GridStepUSD=15`, `MaxLevels=2`,
+`TakeProfitUSD=3`, `StopLossUSD=40`, `MaxHoldHours=24`, `CooldownHours=24`。
+0.50 ロットにすると金額はすべて 50 倍 (純損益 +505 万円 / 最大DD 213 万円)。必要資金の目安は最大DD の 3 倍以上。
+旧初期値に戻すなら `LookbackMinutes=60`, `DipUSD=20`, `TrendFilter=なし`, `MaxLevels=3`, `TakeProfitUSD=5`, `StopLossUSD=30`, `MaxHoldHours=0`, `CooldownHours=0`。
+`Lots=0.50`, `DipUSD=5`, `GridStepUSD=9`, `StopLossUSD=0` (他は旧初期値) にすると履歴に近い動きになる。
+
 ## ファイル
 
 | ファイル | 内容 |
 |---|---|
 | `trades.csv` | スクショから書き起こした 34 本の取引 (決済時刻, 建値, 決済値, 損益円) |
 | `dipstack_bt.py` | 推定ルールのバックテスター (numba) |
-| `study.py` | 取引履歴の集計 + 936 通りの探索 → `results/` |
+| `study.py` | 取引履歴の集計 + 936 通りの探索 → `results/results.md` |
+| `optimize.py` | 改良版の探索 (損切り・H4 SMA100・時間切れ・休み, 151,200 通り) → `results/optimize.md` |
 | `mql5/GoldDipStackEA.mq5` | 同じロジックの MT5 EA (買いのみ) |
 | `fetch_data.py` | 検証データの取得 (data/ はコミットしない) |
 | `tests/` | バックテスターの手計算テスト |
@@ -28,17 +50,13 @@ Chieko さんから届いた MT5 取引履歴のスクリーンショット 5 �
 pip install -r requirements.txt
 python3 fetch_data.py
 python3 study.py
+python3 optimize.py   # 4 コアで約 5 分
 python3 -m pytest -q tests
 ```
-
-## EA の初期値
-
-`Lots=0.01`, `PositionsPerLevel=3`, `DipUSD=20`, `GridStepUSD=15`, `MaxLevels=3`, `TakeProfitUSD=5`, `StopLossUSD=30`, `UseTrendFilter=false`。
-前半・後半とも黒字だった設定の 1 つ (PF 1.02、ほぼ損益ゼロ)。利益を狙う設定ではなく、ストラテジーテスターで挙動を確認するための安全寄りの初期値。
-`Lots=0.50`, `DipUSD=5`, `GridStepUSD=9`, `StopLossUSD=0` にすると履歴に近い動きになる。
 
 ## 前提と未検証の点
 
 * データ: XAUUSD 1 分足 2026-03-26〜2026-09-25 (getdata-finance 無料サンプル, MIT)。10 月のデータはこの環境から取得できず、スクショの 5 日間そのものは再現していない。
 * スプレッド $0.30、買いスワップ $30/ロット/日 (水曜 3 倍)、USDJPY 158 固定。証拠金・ロスカットは計算していない。
+* 改良版の初期値も同じ 6 か月のデータで選んでいる (前半・後半・15 期間・近傍・コスト悪化で確かめたが、データ外の検証ではない)。
 * MQL5 のコンパイルとストラテジーテスターでの確認はしていない (この環境に MT5 が無いため)。
