@@ -1,35 +1,34 @@
 //+------------------------------------------------------------------+
 //|                                          TrendNanpinHedgeEA.mq5  |
 //|  順張りナンピン (ロジック1) + 逆方向ポジションでの救済 (ロジック2) |
+//|  tnh_bt.py / study_risk.py (Python バックテスト) と同じルール。    |
+//|  MT4 版は mql4/TrendNanpinHedgeEA.mq4。                            |
 //|                                                                  |
-//|  tnh_bt.py (Python バックテスト) と同じルール。                    |
-//|                                                                  |
-//|  1) 初回エントリー: シグナルの方向 D に InpLot0 で 1 本目。        |
-//|     シグナルは「RSI 押し目」「高値安値ブレイク」か、                |
-//|     外部 (AI など) がグローバル変数に書いた +1 / -1。              |
+//|  1) 初回エントリー: 5 分足の CCI(14) が 0 を上抜けたら買い、       |
+//|     下抜けたら売り (確定足で判定)。InpAdxMax > 0 なら H1 の ADX が |
+//|     その値より大きい強トレンド中は入らない。                       |
+//|     ほかに RSI 押し目・ブレイク・外部シグナル (AI がグローバル変数 |
+//|     TNH_SIGNAL_<シンボル> に +1 / -1) も選べる。                   |
 //|  2) ロジック1 順張りナンピン: 直前のエントリー位置から             |
 //|     ナンピン間隔だけ逆行するごとに次の 1 本 (最大 InpMaxPositions)。|
-//|     ロット = InpLot0 × InpLotMult^(n-1) を刻みに丸める              |
-//|     (0.01 → 0.02 → 0.02 → 0.03 → 0.05)。                           |
-//|  3) ロジック2 救済: InpHedgeFrom 本目 (既定 3 本目) は D と逆方向。 |
+//|     ロット = InpLot0 × InpLotMult^(n-1) を刻みに丸める。           |
+//|  3) ロジック2 救済: 3 本目と 4 本目は 1 本目と逆方向 (5 本目なし)。|
 //|     逆方向ポジションには 間隔×InpHedgeTPRatio の利確を付ける。     |
-//|     4・5 本目の向きは InpAfterHedge で選ぶ。                       |
 //|  4) 決済: サイクル損益 (救済の確定利益 + 含み損益) が               |
-//|     間隔×InpBasketTPRatio×InpLot0 相当に達したら全決済              |
-//|     (基本 1〜2 本で決済)。                                          |
-//|     InpRevFrom 本 (既定 4 本) 以上持ったら、逆行の最安値 (買いの場合)|
-//|     から 間隔×InpRevRatio 戻った時点で全決済 (反転で即決済)。       |
-//|  5) 安全装置 (任意): サイクル損失が InpMaxLossMoney に達したら全決済。|
+//|     間隔×InpBasketTPRatio×InpLot0 相当に達したら全決済。            |
+//|     4 本持ったら、最も逆行した位置から 間隔×InpRevRatio 戻った     |
+//|     時点で全決済 (反転で即決済)。                                   |
+//|  5) 大負け対策: 1 サイクルの損失が InpMaxLossMoney (口座通貨) に   |
+//|     達したら全決済。                                                |
 //|                                                                  |
-//|  ナンピン間隔は 固定 pips か、日足 ATR(14) × 係数 (既定 0.5)。     |
-//|  間隔はサイクル開始時に決め、そのサイクル中は変えない。            |
+//|  初期値は「バランス型」(固定 300pips, 損失上限 3 万円)。            |
+//|  「守り重視」は TrendNanpinHedge_defensive.set。                   |
 //|  金 (XAU / GOLD) の 1 pip は 0.1 ドルとして扱う (InpPipSize で変更可)。|
-//|                                                                  |
-//|  検証結果は results/compare.md。どの設定もはっきりした優位性は     |
-//|  確認できていないので、実口座の前に必ずデモで確認すること。        |
+//|  検証結果は results/compare_risk.md。はっきりした優位性は確認でき  |
+//|  ていないので、実口座の前に必ずデモで確認すること。                |
 //+------------------------------------------------------------------+
 #property copyright "razanohito/development"
-#property version   "1.00"
+#property version   "1.10"
 
 #include <Trade\Trade.mqh>
 
@@ -41,44 +40,46 @@ enum ENUM_STEP_MODE
 
 enum ENUM_AFTER_HEDGE
   {
-   AFTER_NANPIN_ORIGINAL = 0, // 4・5 本目は元の方向にナンピン
-   AFTER_KEEP_REVERSE    = 1  // 4・5 本目も逆方向 (救済を続ける)
+   AFTER_NANPIN_ORIGINAL = 0, // 4 本目以降は元の方向にナンピン
+   AFTER_KEEP_REVERSE    = 1  // 4 本目以降も逆方向 (救済を続ける)
   };
 
 enum ENUM_ENTRY_MODE
   {
    ENTRY_RSI_PULLBACK = 0, // EMA の向きに RSI 押し目
    ENTRY_BREAKOUT     = 1, // EMA の向きに 高値/安値ブレイク
-   ENTRY_EXTERNAL     = 2  // 外部シグナル (AI がグローバル変数に +1 / -1)
+   ENTRY_EXTERNAL     = 2, // 外部シグナル (AI がグローバル変数に +1 / -1)
+   ENTRY_CCI_ZERO     = 3  // CCI が 0 を上抜けで買い / 下抜けで売り
   };
 
 //--- 入力パラメータ
 input group "ロット・本数"
 input double InpLot0          = 0.01;  // 1 本目のロット
 input double InpLotMult       = 1.5;   // ナンピン倍率
-input int    InpMaxPositions  = 5;     // 1 サイクルの最大本数
+input int    InpMaxPositions  = 4;     // 1 サイクルの最大本数 (5 本目はなし)
 
 input group "ナンピン間隔"
-input ENUM_STEP_MODE InpStepMode = STEP_DAILY_ATR; // 間隔の決め方
-input double InpStepPips      = 50.0;  // 固定のときの間隔 (pips)
+input ENUM_STEP_MODE InpStepMode = STEP_FIXED_PIPS; // 間隔の決め方
+input double InpStepPips      = 300.0; // 固定のときの間隔 (pips。金 1pip=0.1 ドルなので 30 ドル)
 input double InpStepAtrK      = 0.5;   // ATR のときの係数 (間隔 = 日足 ATR × 係数)
 input int    InpAtrPeriod     = 14;    // 日足 ATR の期間
 input double InpPipSize       = 0.0;   // 1 pip の価格幅 (0 = 自動: 金 0.1, 3/5 桁は point×10)
 
 input group "ロジック2 (逆方向で救済)"
 input int    InpHedgeFrom     = 3;     // 何本目から逆方向にするか (0 = 救済しない)
-input ENUM_AFTER_HEDGE InpAfterHedge = AFTER_NANPIN_ORIGINAL; // 救済の後 (4・5 本目) の向き
-input double InpHedgeTPRatio  = 0.5;   // 逆方向ポジションの利確 = 間隔 × この比率
+input ENUM_AFTER_HEDGE InpAfterHedge = AFTER_KEEP_REVERSE; // 救済の後 (4 本目以降) の向き
+input double InpHedgeTPRatio  = 2.0;   // 逆方向ポジションの利確 = 間隔 × この比率
 
 input group "決済"
-input double InpBasketTPRatio = 0.2;   // サイクル利確 = 間隔 × この比率 × 1 本目のロット相当
+input double InpBasketTPRatio = 1.0;   // サイクル利確 = 間隔 × この比率 × 1 本目のロット相当
 input int    InpRevFrom       = 4;     // この本数以上で「反転したら即決済」(0 = 使わない)
 input double InpRevRatio      = 0.5;   // 反転とみなす戻り幅 = 間隔 × この比率
-input double InpMaxLossMoney  = 0.0;   // 1 サイクルの損失がこの金額 (口座通貨) で全決済 (0 = なし)
+input double InpMaxLossMoney  = 30000.0; // 1 サイクルの損失がこの金額 (口座通貨) で全決済 (0 = なし。円口座 30000 ≒ ドル口座 200)
 
 input group "初回エントリー (AI の代わりのルール)"
-input ENUM_ENTRY_MODE InpEntryMode = ENTRY_RSI_PULLBACK; // 初回エントリーの決め方
-input ENUM_TIMEFRAMES InpSignalTF  = PERIOD_H1;          // シグナルを見る時間足
+input ENUM_ENTRY_MODE InpEntryMode = ENTRY_CCI_ZERO;     // 初回エントリーの決め方
+input ENUM_TIMEFRAMES InpSignalTF  = PERIOD_M5;          // シグナルを見る時間足
+input int    InpCciPeriod     = 14;    // CCI 期間 (典型価格)
 input int    InpEmaPeriod     = 200;   // トレンド判定の EMA 期間
 input int    InpRsiPeriod     = 14;    // RSI 期間
 input double InpRsiBuyLevel   = 40.0;  // 上昇トレンドで RSI がこの値を下から上に抜けたら買い
@@ -87,6 +88,9 @@ input int    InpBreakoutBars  = 20;    // ブレイクに使う直近の本数
 input string InpSignalGVName  = "";    // 外部シグナルのグローバル変数名 (空 = TNH_SIGNAL_<シンボル>)
 input bool   InpAllowBuy      = true;  // 買いから始めるサイクルを許可
 input bool   InpAllowSell     = true;  // 売りから始めるサイクルを許可
+input double InpAdxMax        = 0.0;   // 強トレンド停止: ADX がこの値より大きいときは新規に入らない (0 = なし, 守り重視は 25)
+input ENUM_TIMEFRAMES InpAdxTF     = PERIOD_H1;          // ADX を見る時間足
+input int    InpAdxPeriod     = 14;    // ADX 期間
 input double InpMaxSpreadPips = 0.0;   // これより広いスプレッドでは建てない (0 = 制限なし)
 
 input group "その他"
@@ -97,6 +101,8 @@ input int    InpSlippagePoints = 50;
 CTrade   g_trade;
 int      g_ema = INVALID_HANDLE;
 int      g_rsi = INVALID_HANDLE;
+int      g_cci = INVALID_HANDLE;
+int      g_adx = INVALID_HANDLE;
 int      g_atr = INVALID_HANDLE;
 double   g_pip = 0.0;
 datetime g_last_sig_bar = 0;
@@ -119,7 +125,8 @@ int OnInit()
    if(InpLot0 <= 0.0 || InpLotMult <= 0.0 || InpMaxPositions < 1 || InpStepPips <= 0.0 ||
       InpStepAtrK <= 0.0 || InpAtrPeriod < 1 || InpHedgeFrom < 0 || InpHedgeTPRatio <= 0.0 ||
       InpBasketTPRatio <= 0.0 || InpRevFrom < 0 || InpRevRatio <= 0.0 || InpMaxLossMoney < 0.0 ||
-      InpEmaPeriod < 1 || InpRsiPeriod < 1 || InpBreakoutBars < 1)
+      InpEmaPeriod < 1 || InpRsiPeriod < 1 || InpBreakoutBars < 1 || InpCciPeriod < 2 ||
+      InpAdxMax < 0.0 || InpAdxPeriod < 1)
      {
       Print("入力値が不正です");
       return INIT_PARAMETERS_INCORRECT;
@@ -132,7 +139,10 @@ int OnInit()
    g_ema = iMA(_Symbol, InpSignalTF, InpEmaPeriod, 0, MODE_EMA, PRICE_CLOSE);
    g_rsi = iRSI(_Symbol, InpSignalTF, InpRsiPeriod, PRICE_CLOSE);
    g_atr = iATR(_Symbol, PERIOD_D1, InpAtrPeriod);
-   if(g_ema == INVALID_HANDLE || g_rsi == INVALID_HANDLE || g_atr == INVALID_HANDLE)
+   g_cci = iCCI(_Symbol, InpSignalTF, InpCciPeriod, PRICE_TYPICAL);
+   g_adx = iADX(_Symbol, InpAdxTF, InpAdxPeriod);
+   if(g_ema == INVALID_HANDLE || g_rsi == INVALID_HANDLE || g_atr == INVALID_HANDLE ||
+      g_cci == INVALID_HANDLE || g_adx == INVALID_HANDLE)
      {
       Print("インジケーターを作成できません: ", GetLastError());
       return INIT_FAILED;
@@ -151,6 +161,8 @@ void OnDeinit(const int reason)
   {
    if(g_ema != INVALID_HANDLE) IndicatorRelease(g_ema);
    if(g_rsi != INVALID_HANDLE) IndicatorRelease(g_rsi);
+   if(g_cci != INVALID_HANDLE) IndicatorRelease(g_cci);
+   if(g_adx != INVALID_HANDLE) IndicatorRelease(g_adx);
    if(g_atr != INVALID_HANDLE) IndicatorRelease(g_atr);
    Comment("");
   }
@@ -368,6 +380,19 @@ bool OpenPosition(int dir, double lots, double tp_dist, int level)
   }
 
 //+------------------------------------------------------------------+
+//| 強トレンド (確定足の ADX > InpAdxMax) なら true                    |
+//+------------------------------------------------------------------+
+bool StrongTrend()
+  {
+   if(InpAdxMax <= 0.0)
+      return false;
+   double adx[1];
+   if(CopyBuffer(g_adx, 0, 1, 1, adx) != 1)
+      return true;  // 取れないときは入らない
+   return adx[0] > InpAdxMax;
+  }
+
+//+------------------------------------------------------------------+
 //| 初回エントリーのシグナル (確定足で判定)                           |
 //+------------------------------------------------------------------+
 int EntrySignal()
@@ -386,6 +411,18 @@ int EntrySignal()
    datetime bar = iTime(_Symbol, InpSignalTF, 0);
    if(bar == 0 || bar == g_last_sig_bar)
       return 0;
+   if(InpEntryMode == ENTRY_CCI_ZERO)
+     {
+      double cc[2];
+      if(CopyBuffer(g_cci, 0, 1, 2, cc) != 2)  // cc[0]=2 本前, cc[1]=1 本前
+         return 0;
+      g_last_sig_bar = bar;
+      if(cc[0] < 0.0 && cc[1] >= 0.0)
+         return 1;
+      if(cc[0] > 0.0 && cc[1] <= 0.0)
+         return -1;
+      return 0;
+     }
    double ema[1], cls[1];
    if(CopyBuffer(g_ema, 0, 1, 1, ema) != 1 || CopyClose(_Symbol, InpSignalTF, 1, 1, cls) != 1)
       return 0;
@@ -460,6 +497,10 @@ void OnTick()
          return;
         }
       int sig = EntrySignal();
+      if(sig != 0 && StrongTrend())
+        {
+         sig = 0;  // 強いトレンドの最中は入らない
+        }
       if(sig == 0 || (sig > 0 && !InpAllowBuy) || (sig < 0 && !InpAllowSell))
         {
          ShowStatus(bid);
